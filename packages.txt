@@ -1,3 +1,0 @@
-libgomp1
-build-essential
-python3-dev
