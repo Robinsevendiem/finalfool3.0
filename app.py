@@ -135,7 +135,7 @@ def load_model(path=None):
         return None
         
     try:
-        return TabularPredictor.load(target_path)
+        return TabularPredictor.load(target_path, require_version_match=False)
     except Exception as e:
         # 在 Streamlit UI 中显示错误，方便排查
         st.error(f"模型文件加载失败 ({target_path}): {e}")
