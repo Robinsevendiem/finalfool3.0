@@ -19,7 +19,9 @@ NAME_MAP = {
     '161129.SZ': '南方原油',
     '501018.SH': '南方原油'
 }
-DATA_DIR = 'market_data'
+# 获取项目根目录
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, 'market_data')
 
 def load_data():
     data = {}

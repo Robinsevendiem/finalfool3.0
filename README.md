@@ -44,17 +44,17 @@ streamlit run app.py
 
 ---
 
+## 🛠️ 数据一致性保障 (Consistency Fixes)
+为了解决本地回测与 Streamlit 部署端数据不一致的问题，系统已完成以下优化：
+1. **统一特征计算逻辑**: 无论是区间回测还是单日决策，均调用同一套 `calculate_indicators` 函数，消除窗口定义歧义。
+2. **修复未来函数与交易细节**: 修正了回测逻辑，确保 $T$ 日的持仓由 $T-1$ 日信号决定。同时模拟了更真实的交易行为：调仓日以 $T$ 日开盘价成交（收益为日内涨跌），持仓日享受全天收益。
+3. **环境确定性**: 通过 `requirements.txt` 锁定核心库版本（如 `autogluon.tabular==1.2.0`），确保模型推理结果跨平台一致。
+4. **确定性数据加载**: 优化了多数据源映射逻辑，确保相同资产名称在不同环境下加载相同的底层 CSV 文件。
+
 ## ☁️ 网页部署 (Streamlit Cloud)
-
-本项目已针对 Streamlit Cloud 进行优化，部署步骤如下：
-
 1. **上传 GitHub**: 确保 `.gitignore` 允许上传 `AutogluonModels/` 下的必需模型文件夹。
 2. **连接 Streamlit Cloud**: 在 Streamlit 控制台连接你的 GitHub 仓库。
-3. **配置 Secrets**: 在 Streamlit Cloud 的设置界面（Advanced settings -> Secrets）中添加：
-   ```toml
-   TS_TOKEN = "你的Tushare_Token"
-   ```
-4. **部署**: 点击 Deploy 即可。
+3. **设置 Secrets**: 在 Streamlit Cloud 后台的 `Secrets` 中添加 `TS_TOKEN` (Tushare 令牌)。
 
 ---
 
@@ -62,10 +62,13 @@ streamlit run app.py
 
 - `app.py`: Web 交互终端主程序。
 - `update_data.py`: 市场数据自动同步引擎。
-- `build_performance_dataset.py`: 绩效优化版数据集构建。
-- `train_performance_optimized.py`: 绩效优化版模型训练脚本。
-- `market_data/`: 历史行情数据存储。
+- `research_and_training/`: 包含所有数据集构建和模型训练的脚本。
+  - `build_performance_dataset.py`: 绩效优化版数据集构建。
+  - `train_performance_optimized.py`: 绩效优化版模型训练脚本。
+- `market_data/`: 历史行情数据存储（CSV）。
 - `AutogluonModels/`: 预训练好的模型权重。
+- `local_tools/`: 包含本地运行的快捷工具。
+- `requirements.txt` & `packages.txt`: 部署依赖配置文件。
 
 ---
 

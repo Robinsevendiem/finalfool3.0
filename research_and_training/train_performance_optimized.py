@@ -28,7 +28,9 @@ def train_performance_model():
     
     print("2. Training AutoGluon (Optimizing for Returns)...")
     # 这里的目标不再是模仿，而是通过特征预测未来哪个标的表现最好
-    save_path = 'AutogluonModels/performance_v1'
+    # 获取项目根目录
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    save_path = os.path.join(BASE_DIR, 'AutogluonModels/performance_v1')
     
     # 优化配置：极致稳定性，确保模型能够顺利生成
     predictor = TabularPredictor(

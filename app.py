@@ -94,6 +94,7 @@ def load_market_data():
             df['date'] = pd.to_datetime(df['trade_date'].astype(str))
             df = df.sort_values('date').reset_index(drop=True)
             if 'close_qfq' in df.columns: df['close'] = df['close_qfq']
+            if 'open_qfq' in df.columns: df['open'] = df['open_qfq']
             if 'vol' in df.columns: df['volume'] = df['vol']
             
             name = None
@@ -105,9 +106,12 @@ def load_market_data():
                 df['name'] = name
                 df['code'] = code
                 
-                # If multiple files exist for the same asset name, 
-                # keep the one with the most data (longest history)
+                # 如果同一个资产名称对应多个文件（如 588120 和 588000 都是科创板），
+                # 我们需要一个确定的逻辑来选择，避免在 Streamlit 上加载了不同的文件。
+                # 逻辑：优先选择代码在 NAME_MAP 中靠前的，或者数据量更多的。
                 if name in data:
+                    # 如果当前文件的代码在映射表中更早出现，或者数据更长，则替换
+                    existing_code = data[name]['code'].iloc[0]
                     if len(df) > len(data[name]):
                         data[name] = df
                 else:
@@ -145,253 +149,187 @@ def calc_max_drawdown(prices):
     # Return max drawdown (min value, since dd is negative)
     return drawdown.min()
 
+def calculate_indicators(window_close, window_returns):
+    """统一的特征计算逻辑，确保回测与单日决策完全一致"""
+    if len(window_close) < 2:
+        return {f: 0.0 for f in ['ret', 'vol', 'slope', 'r2', 'mdd', 'sxr', 'sharp']}
+    
+    # 收益率：当前价格 / 窗口起始价格 - 1
+    ret = (window_close[-1] / window_close[0]) - 1
+    # 波动率：收益率序列的标准差 * sqrt(252)
+    vol = np.std(window_returns) * np.sqrt(252)
+    # 趋势与拟合度
+    slope = calc_slope(window_close)
+    r2 = calc_r2(window_close)
+    # 最大回撤
+    mdd = calc_max_drawdown(window_close)
+    # 复合指标
+    sxr = slope * r2
+    sharp = slope / (vol + 0.01)
+    
+    return {
+        'ret': ret,
+        'vol': vol,
+        'slope': slope,
+        'r2': r2,
+        'mdd': mdd,
+        'sxr': sxr,
+        'sharp': sharp
+    }
+
 def prepare_all_features_cached(data_dict, windows, warmup=True, start_date=None):
     """
-    Pre-calculate all static features.
-    warmup: If True, uses full history. If False, masks data before start_date (simulating fresh start).
+    预计算所有特征。
     """
     all_dates = set()
     for df in data_dict.values():
         all_dates.update(df['date'].tolist())
     sorted_dates = sorted(list(all_dates))
     
-    # Process each asset
     processed_data = {} 
     
     for name, df in data_dict.items():
         sub = df.set_index('date').sort_index()
         df_feat = sub.copy()
         
-        # If no warmup, we must mask data before start_date for calculation
-        # But we still need the rows to exist.
-        # Actually, if we don't warmup, the window functions at start_date will be NaN.
-        # This is naturally handled if we just pass the full dataframe but the user accepts NaNs at the start.
-        # However, if user explicitly wants "No History used", we should probably trim the input DF?
-        # But rolling window NEEDS history. If you cut history, rolling window is NaN.
-        # So "No Warmup" effectively means "First 30 days are NaN/Cash".
-        
-        # Let's keep calculation as is (vectorized on full data), 
-        # but in the backtest loop, we can check if enough data is available *relative to start_date*?
-        # No, simpler: just calculate. If data exists, it exists.
-        # The user's request "Don't use history before selected date" implies:
-        # On Day 0 of backtest, Ret_23 should be NaN (or based on 0 history).
-        # This forces the model to see "Missing Data" and likely choose Cash.
-        
-        if not warmup and start_date:
-            # Mask data before start_date
-            # We can't delete rows because we need to iterate dates.
-            # We can set values to NaN before start_date?
-            # Better: Filter df to start from start_date
-            df_feat = df_feat[df_feat.index >= pd.Timestamp(start_date)]
-            
-        # Pre-calc daily ret for backtest
+        # 预计算每日收益率（用于波动率计算）
         df_feat['daily_ret'] = df_feat['close'].pct_change().fillna(0.0)
-            
+        
         close_vals = df_feat['close'].values
+        ret_vals = df_feat['daily_ret'].values
         
         for w in windows:
-            # Ret
-            df_feat[f'ret_{w}'] = df_feat['close'].pct_change(w)
-            
-            # Vol
-            df_feat[f'vol_{w}'] = df_feat['close'].pct_change().rolling(w).std() * np.sqrt(252)
-            
-            # Slope & R2 & MaxDD
-            s_list = []
-            r_list = []
-            mdd_list = []
-            # We need to re-index close_vals if we filtered
-            curr_close = df_feat['close'].values
+            # 初始化列表
+            feats = {f: [np.nan]*len(df_feat) for f in ['ret', 'vol', 'slope', 'r2', 'mdd', 'sxr', 'sharp']}
             
             for i in range(len(df_feat)):
-                if i < w:
-                    s_list.append(np.nan)
-                    r_list.append(np.nan)
-                    mdd_list.append(np.nan)
-                else:
-                    win = curr_close[i-w+1 : i+1]
-                    s_list.append(calc_slope(win))
-                    r_list.append(calc_r2(win))
-                    mdd_list.append(calc_max_drawdown(win))
-            df_feat[f'slope_{w}'] = s_list
-            df_feat[f'r2_{w}'] = r_list
-            df_feat[f'mdd_{w}'] = mdd_list
-            df_feat[f'sxr_{w}'] = df_feat[f'slope_{w}'] * df_feat[f'r2_{w}']
-            # 新增：风险调整后动量
-            df_feat[f'sharp_{w}'] = df_feat[f'slope_{w}'] / (df_feat[f'vol_{w}'] + 0.01)
+                if i >= w - 1:
+                    win_close = close_vals[i-w+1 : i+1]
+                    win_ret = ret_vals[i-w+1 : i+1]
+                    res = calculate_indicators(win_close, win_ret)
+                    for k, v in res.items():
+                        feats[k][i] = v
+            
+            # 写入 DataFrame
+            for k, v in feats.items():
+                df_feat[f'{k}_{w}'] = v
              
         processed_data[name] = df_feat
         
     return processed_data, sorted_dates
 
 def run_backtest_range(predictor, data_dict, start_date, end_date, model_name, initial_holding=None, force_neutral=False, use_warmup=True):
-    # 1. Pre-calculate features
+    # 1. 预计算特征
     with st.spinner("正在预计算全量特征..."):
-        # We need to pass start_date if warmup is False
         s_str = str(start_date) if not use_warmup else None
-        # Cache key must include warmup params
         processed_data, all_dates = prepare_all_features_cached(data_dict, WINDOWS, warmup=use_warmup, start_date=s_str)
     
-    # Filter dates
+    # 过滤日期
     s_ts = pd.Timestamp(start_date)
     e_ts = pd.Timestamp(end_date)
     sim_dates = [d for d in all_dates if d >= s_ts and d <= e_ts]
     
     if not sim_dates:
-        return None, "Selected range has no trading days."
+        return None, "所选范围内没有交易日。"
         
     history = []
     current_holding = initial_holding
     
+    # 找到第一个模拟日的前一个交易日索引
+    # 我们需要 T-1 日的特征来决定 T 日的持仓
     progress_bar = st.progress(0)
     
     for i, d in enumerate(sim_dates):
-        # Update progress
         progress_bar.progress((i + 1) / len(sim_dates))
         
-        # Build features for this day
-        daily_rows = []
-        
-        # Determine is_held status based on mode
-        # If force_neutral is True, we always pretend we hold nothing (Opportunity Hunter Mode)
-        effective_holding = None if force_neutral else current_holding
-        
-        # Real Assets
-        for name, df in processed_data.items():
-            if d in df.index:
-                row = df.loc[d]
-                if pd.notnull(row['slope_23']): # Valid
-                    # Feature dict
-                    feat = {
-                        'name': name,
-                        'is_held': 1 if effective_holding == name else 0
-                    }
-                    for w in WINDOWS:
-                        feat[f'ret_{w}'] = row[f'ret_{w}']
-                        feat[f'vol_{w}'] = row[f'vol_{w}']
-                        feat[f'slope_{w}'] = row[f'slope_{w}']
-                        feat[f'r2_{w}'] = row[f'r2_{w}']
-                        feat[f'mdd_{w}'] = row[f'mdd_{w}']
-                        feat[f'sxr_{w}'] = row[f'sxr_{w}']
-                        feat[f'sharp_{w}'] = row[f'sharp_{w}']
-                    daily_rows.append(feat)
-        
-        # Cash Asset
-        cash_feat = {
-            'name': '现金',
-            'is_held': 1 if effective_holding == '现金' else 0
-        }
-        for w in WINDOWS:
-             for f in ['ret', 'vol', 'slope', 'r2', 'mdd', 'sxr', 'sharp']:
-                 cash_feat[f'{f}_{w}'] = 0.0
-        daily_rows.append(cash_feat)
-        
-        # DataFrame & Rank
-        df_day = pd.DataFrame(daily_rows)
-        feature_cols = []
-        for w in WINDOWS:
-            feature_cols.extend([f'ret_{w}', f'vol_{w}', f'slope_{w}', f'r2_{w}', f'mdd_{w}', f'sxr_{w}', f'sharp_{w}'])
-            
-        for col in feature_cols:
-            df_day[f'rank_{col}'] = df_day[col].rank(pct=True)
-            
-        # Context
-        non_cash = df_day[df_day['name'] != '现金']
-        if not non_cash.empty:
-            df_day['market_max_slope'] = non_cash['slope_23'].max()
-            df_day['market_max_ret'] = non_cash['ret_23'].max()
+        # --- 核心逻辑：使用 T-1 日的数据决定 T 日持仓 ---
+        # 1. 找到 d 日在 all_dates 中的索引
+        d_idx = all_dates.index(d)
+        if d_idx == 0:
+            # 第一天没有 T-1，保持初始持仓
+            top_pick = current_holding if current_holding else '现金'
+            top_score = 1.0
         else:
-            df_day['market_max_slope'] = 0
-            df_day['market_max_ret'] = 0
+            prev_d = all_dates[d_idx - 1] # T-1 日
             
-        # Predict
-        try:
-            probs = predictor.predict_proba(df_day, model=model_name)
-        except KeyError as e:
-            st.error(f"❌ 特征缺失错误: {e}")
-            st.write("当前 DataFrame 列名:", df_day.columns.tolist())
-            st.write("请尝试点击左侧【清除缓存】按钮并重试。")
-            st.stop()
-        if 1 in probs.columns:
-            score_col = 1
-        else:
-            score_col = probs.columns[-1]
+            # 构建 T-1 日的特征矩阵
+            daily_rows = []
+            effective_holding = None if force_neutral else current_holding
             
-        df_day['score'] = probs[score_col]
-        df_day = df_day.sort_values('score', ascending=False)
+            for name, df in processed_data.items():
+                if prev_d in df.index:
+                    row = df.loc[prev_d]
+                    if pd.notnull(row['slope_23']):
+                        feat = {'name': name, 'is_held': 1 if effective_holding == name else 0}
+                        for w in WINDOWS:
+                            for f in ['ret', 'vol', 'slope', 'r2', 'mdd', 'sxr', 'sharp']:
+                                feat[f'{f}_{w}'] = row[f'{f}_{w}']
+                        daily_rows.append(feat)
+            
+            # 现金资产特征
+            cash_feat = {'name': '现金', 'is_held': 1 if effective_holding == '现金' else 0}
+            for w in WINDOWS:
+                for f in ['ret', 'vol', 'slope', 'r2', 'mdd', 'sxr', 'sharp']:
+                    cash_feat[f'{f}_{w}'] = 0.0
+            daily_rows.append(cash_feat)
+            
+            df_day = pd.DataFrame(daily_rows)
+            # 计算排名
+            for w in WINDOWS:
+                for f in ['ret', 'vol', 'slope', 'r2', 'mdd', 'sxr', 'sharp']:
+                    col = f'{f}_{w}'
+                    df_day[f'rank_{col}'] = df_day[col].rank(pct=True)
+            
+            # 市场上下文
+            non_cash = df_day[df_day['name'] != '现金']
+            df_day['market_max_slope'] = non_cash['slope_23'].max() if not non_cash.empty else 0
+            df_day['market_max_ret'] = non_cash['ret_23'].max() if not non_cash.empty else 0
+            
+            # 预测
+            try:
+                probs = predictor.predict_proba(df_day, model=model_name)
+                score_col = 1 if 1 in probs.columns else probs.columns[-1]
+                df_day['score'] = probs[score_col]
+                df_day = df_day.sort_values('score', ascending=False)
+                top_pick = df_day.iloc[0]['name']
+                top_score = df_day.iloc[0]['score']
+            except Exception as e:
+                st.error(f"预测失败: {e}")
+                st.stop()
         
-        # Decision
-        top_pick = df_day.iloc[0]['name']
-        top_score = df_day.iloc[0]['score']
-        
-        # Record
-        # Calculate daily return for this day
-        # Strategy Return:
-        # If we held 'current_holding' coming INTO this day, we get its return.
-        # But wait, decision is made at CLOSE? Or OPEN?
-        # Usually backtest: Decision at Close T, Trade at Open T+1? Or Trade at Close T?
-        # This strategy uses Close prices to decide.
-        # Assuming we trade at Close T (Simulated).
-        # So the return we get TODAY depends on what we held YESTERDAY.
-        
-        # Actually, let's simplify:
-        # We hold 'prev_holding' from Yesterday Close to Today Close.
-        # So Today's Strategy Return = Return of 'prev_holding'.
+        # --- 计算 T 日收益 ---
+        # 逻辑：T-1日产生信号，T日开盘执行。
+        # 如果发生调仓 (top_pick != current_holding)：使用 T日开盘价买入，计算 T日(收盘/开盘-1) 的收益。
+        # 如果不调仓 (top_pick == current_holding)：计算 T日(收盘/昨收-1) 的全天收益。
         
         daily_ret = 0.0
-        holding_pct_chg = 0.0
-        close_open_ratio = 0.0
         
-        if current_holding and current_holding != '现金':
-             if current_holding in processed_data and d in processed_data[current_holding].index:
-                 row_asset = processed_data[current_holding].loc[d]
-                 # pct_change is (Close - PrevClose) / PrevClose
-                 # We can use that directly from data if available, or calc it.
-                 # row['ret_1'] is not exactly daily return if window is not 1.
-                 # Let's use close / pre_close - 1
-                 # But we pre-calculated ret_10, etc. Not ret_1.
-                 # We have close. We need prev_close.
-                 # Tushare data has 'pre_close'. If not, use shift.
-                 
-                 # Let's rely on data_dict original data for precision?
-                 # processed_data is a copy.
-                 
-                 curr_close = row_asset['close']
-                 # We need open for Close/Open ratio
-                 # Tushare data has 'open'.
-                 curr_open = row_asset.get('open', curr_close) # Fallback
-                 
-                 # Prev Close?
-                 # We can't easily get prev row in this loop without index lookup.
-                 # But 'ret_1' (if we had it) would be nice.
-                 # Let's assume we can get it from 'ret_10' - no.
-                 
-                 # Quick fix: Calculate daily ret on the fly or pre-calc in prepare_all_features
-                 # Let's assume pre_close is available or we can approximate.
-                 # Actually, we can just fetch it from data_dict since we have the date.
-                 # data_dict[current_holding]
-                 
-                 # Better: Pre-calculate daily_ret in prepare_all_features
-                 daily_ret = row_asset.get('daily_ret', 0.0) 
-                 holding_pct_chg = daily_ret
-                 
-                 if curr_open != 0:
-                     close_open_ratio = curr_close / curr_open - 1
-                 
-        elif current_holding == '现金':
-            daily_ret = 0.0 # Cash return
-            
+        if top_pick != current_holding:
+            # 调仓日：计算新持仓的日内收益 (Close/Open - 1)
+            if top_pick != '现金' and top_pick in processed_data:
+                asset_df = processed_data[top_pick]
+                if d in asset_df.index:
+                    row = asset_df.loc[d]
+                    c = row['close']
+                    o = row.get('open', c)
+                    if o != 0:
+                        daily_ret = (c / o) - 1
+        else:
+            # 持仓不变日：计算原持仓的全天收益 (Close/PrevClose - 1)
+            if current_holding and current_holding != '现金':
+                if current_holding in processed_data and d in processed_data[current_holding].index:
+                    daily_ret = processed_data[current_holding].loc[d].get('daily_ret', 0.0)
+        
         history.append({
             'date': d.date(),
             'holding': top_pick,
             'prev_holding': current_holding if current_holding else "空仓(初始)",
             'score': top_score,
             'action': 'Switch' if top_pick != current_holding else 'Hold',
-            'daily_ret': daily_ret,
-            'close_open_pct': close_open_ratio
+            'daily_ret': daily_ret
         })
         
-        # Update State
+        # 更新状态：T 日收盘后的持仓变为 top_pick
         current_holding = top_pick
         
     return pd.DataFrame(history), None
@@ -478,17 +416,16 @@ def prepare_daily_features(data_dict, current_holding, target_date=None):
             }
             
             close_vals = sub['close'].values
+            # 我们还需要 daily_ret 序列来计算波动率
+            daily_rets = sub['close'].pct_change().fillna(0.0).values
             
             for w in WINDOWS:
                 window_data = close_vals[idx-w+1 : idx+1]
-                sample[f'ret_{w}'] = (window_data[-1] / window_data[0]) - 1
-                pct_window = sub['close'].pct_change().values[idx-w+1 : idx+1]
-                sample[f'vol_{w}'] = np.std(pct_window) * np.sqrt(252)
-                sample[f'slope_{w}'] = calc_slope(window_data)
-                sample[f'r2_{w}'] = calc_r2(window_data)
-                sample[f'mdd_{w}'] = calc_max_drawdown(window_data)
-                sample[f'sxr_{w}'] = sample[f'slope_{w}'] * sample[f'r2_{w}']
-                sample[f'sharp_{w}'] = sample[f'slope_{w}'] / (sample[f'vol_{w}'] + 0.01)
+                window_rets = daily_rets[idx-w+1 : idx+1]
+                
+                res = calculate_indicators(window_data, window_rets)
+                for k, v in res.items():
+                    sample[f'{k}_{w}'] = v
                 
             daily_snapshot.append(sample)
             
@@ -617,8 +554,13 @@ if st.sidebar.button("📊 投顾控制台"):
     navigate_to("dashboard")
 if st.sidebar.button("📚 关于模型原理"):
     navigate_to("about")
-if st.sidebar.button("🎯 镜像策略中心"):
+if st.sidebar.button("🎯 镜像策略中心", use_container_width=True):
     navigate_to("mirror")
+    st.rerun()
+
+st.sidebar.markdown("---")
+st.sidebar.link_button("🌡️ 温度计指标 (外部跳转)", "https://robinindicator.streamlit.app/", use_container_width=True, help="跳转至外部温度计指标实时看板")
+st.sidebar.markdown("---")
 
 # Data Update
 if st.sidebar.button("🔄 更新市场数据 (Tushare)"):
