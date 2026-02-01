@@ -124,16 +124,21 @@ def load_market_data():
 def load_model(path=None):
     target_path = path if path else MODEL_PATH
     predictor_file = os.path.join(target_path, 'predictor.pkl')
+    models_dir = os.path.join(target_path, 'models')
     
     if not os.path.exists(predictor_file):
-        # 如果文件不存在，不要让 cache_resource 记住这个 None 结果
-        # 我们可以通过抛出异常或者不使用缓存的方式处理
+        return None
+    
+    # 额外检查 models 目录是否存在，防止上传 GitHub 时漏掉子目录
+    if not os.path.exists(models_dir):
+        st.error(f"⚠️ 核心模型目录缺失: {models_dir}。请检查 GitHub 仓库是否完整上传了 models 文件夹。")
         return None
         
     try:
         return TabularPredictor.load(target_path)
     except Exception as e:
-        print(f"Error loading model at {target_path}: {e}")
+        # 在 Streamlit UI 中显示错误，方便排查
+        st.error(f"模型文件加载失败 ({target_path}): {e}")
         return None
 
 @st.cache_data
@@ -845,9 +850,12 @@ elif st.session_state.page == "dashboard":
     elif mode == "区间回测 (Backtest)":
         st.header("📈 历史区间回测模拟")
         
-        if model_loaded:
-            # Backtest Settings
-            col1, col2 = st.columns(2)
+        if not model_loaded:
+            st.warning("⚠️ 当前模型版本未加载成功，无法进行回测。请在侧边栏切换版本。")
+            st.stop()
+
+        # Backtest Settings
+        col1, col2 = st.columns(2)
         
         all_d = []
         for df in data_dict.values(): all_d.extend(df['date'].tolist())
