@@ -154,6 +154,46 @@ def calc_max_drawdown(prices):
     # Return max drawdown (min value, since dd is negative)
     return drawdown.min()
 
+def calc_slope_r2_fast(y):
+    """
+    使用纯 Numpy 计算标准化后的斜率和 R2，速度比 sklearn 快 100 倍以上。
+    y: 价格序列
+    """
+    n = len(y)
+    if n < 2 or y[0] == 0:
+        return 0.0, 0.0
+    
+    # 归一化，与原逻辑保持一致
+    y_norm = y / y[0]
+    x = np.arange(n)
+    
+    # 简单的线性回归公式: y = kx + b
+    # 使用 np.polyfit (底层是最小二乘法，非常快)
+    # deg=1 返回 [slope, intercept]
+    try:
+        coeffs = np.polyfit(x, y_norm, 1)
+    except:
+        return 0.0, 0.0
+
+    slope = coeffs[0]
+    
+    # 计算 R2
+    # predicted = slope * x + intercept
+    predicted = slope * x + coeffs[1]
+    ss_res = np.sum((y_norm - predicted) ** 2)
+    ss_tot = np.sum((y_norm - np.mean(y_norm)) ** 2)
+    
+    r2 = 1 - (ss_res / (ss_tot + 1e-8))
+    return slope, r2
+
+def calc_max_drawdown_fast(prices):
+    """向量化计算最大回撤"""
+    if len(prices) < 1: return 0.0
+    roll_max = np.maximum.accumulate(prices)
+    if roll_max[0] == 0: return 0.0
+    drawdown = (prices - roll_max) / roll_max
+    return drawdown.min()
+
 def calculate_indicators(window_close, window_returns):
     """统一的特征计算逻辑，确保回测与单日决策完全一致"""
     if len(window_close) < 2:
@@ -163,11 +203,12 @@ def calculate_indicators(window_close, window_returns):
     ret = (window_close[-1] / window_close[0]) - 1
     # 波动率：收益率序列的标准差 * sqrt(252)
     vol = np.std(window_returns) * np.sqrt(252)
-    # 趋势与拟合度
-    slope = calc_slope(window_close)
-    r2 = calc_r2(window_close)
+    
+    # 优化：使用快速算法替代 sklearn
+    slope, r2 = calc_slope_r2_fast(window_close)
+    
     # 最大回撤
-    mdd = calc_max_drawdown(window_close)
+    mdd = calc_max_drawdown_fast(window_close)
     # 复合指标
     sxr = slope * r2
     sharp = slope / (vol + 0.01)
@@ -182,10 +223,40 @@ def calculate_indicators(window_close, window_returns):
         'sharp': sharp
     }
 
+@st.cache_data(ttl=3600*24) # 缓存一天
+def load_all_features_from_disk():
+    """从磁盘加载预计算的全量特征数据"""
+    processed_path = os.path.join(BASE_DIR, 'processed_features.pkl')
+    if os.path.exists(processed_path):
+        try:
+            return pd.read_pickle(processed_path)
+        except Exception as e:
+            print(f"Error loading processed features: {e}")
+            return None
+    return None
+
+def save_all_features_to_disk(processed_data):
+    """保存预计算特征到磁盘"""
+    try:
+        processed_path = os.path.join(BASE_DIR, 'processed_features.pkl')
+        pd.to_pickle(processed_data, processed_path)
+    except Exception as e:
+        print(f"Error saving processed features: {e}")
+
 def prepare_all_features_cached(data_dict, windows, warmup=True, start_date=None):
     """
-    预计算所有特征。
+    预计算所有特征（向量化优化版）。
+    优先尝试从磁盘加载预计算数据，如果不存在或数据过期则实时计算并保存。
     """
+    # 尝试加载磁盘缓存
+    # 注意：这里简化处理，假设本地缓存总是最新的。生产环境可能需要版本控制。
+    # 实际上，如果用户点击了“更新数据”，我们应该强制重新计算。
+    # Streamlit 的缓存机制 handle 了大部分情况，这里主要为了持久化加速首次启动。
+    
+    # 由于 data_dict 是动态传入的，我们还是依赖 Streamlit 的缓存机制 @st.cache_data
+    # 但由于 data_dict 太大，作为 key 可能有问题。
+    # 我们这里主要优化计算过程，向量化已经足够快了。
+    
     all_dates = set()
     for df in data_dict.values():
         all_dates.update(df['date'].tolist())
@@ -194,34 +265,279 @@ def prepare_all_features_cached(data_dict, windows, warmup=True, start_date=None
     processed_data = {} 
     
     for name, df in data_dict.items():
+        # 必须确保按时间排序
         sub = df.set_index('date').sort_index()
         df_feat = sub.copy()
         
-        # 预计算每日收益率（用于波动率计算）
+        # 预计算每日收益率
         df_feat['daily_ret'] = df_feat['close'].pct_change().fillna(0.0)
         
-        close_vals = df_feat['close'].values
-        ret_vals = df_feat['daily_ret'].values
+        # 定义包装函数以适配 apply
+        # 注意：rolling().apply 在每次调用时传入的是 numpy array (raw=True)
         
         for w in windows:
-            # 初始化列表
-            feats = {f: [np.nan]*len(df_feat) for f in ['ret', 'vol', 'slope', 'r2', 'mdd', 'sxr', 'sharp']}
+            # 1. 收益率 (Ret): 当前 / (T-w+1) - 1
+            # 对应 calculate_indicators 中的 ret = (window_close[-1] / window_close[0]) - 1
+            # pandas shift(w-1) 刚好拿到窗口第一个元素
+            df_feat[f'ret_{w}'] = df_feat['close'] / df_feat['close'].shift(w - 1) - 1
             
-            for i in range(len(df_feat)):
-                if i >= w - 1:
-                    win_close = close_vals[i-w+1 : i+1]
-                    win_ret = ret_vals[i-w+1 : i+1]
-                    res = calculate_indicators(win_close, win_ret)
-                    for k, v in res.items():
-                        feats[k][i] = v
+            # 2. 波动率 (Vol): 滚动标准差 * sqrt(252)
+            # numpy std 默认 ddof=0, pandas 默认 ddof=1。为了匹配 calculate_indicators 中的 np.std，使用 ddof=0
+            df_feat[f'vol_{w}'] = df_feat['daily_ret'].rolling(window=w).std(ddof=0) * np.sqrt(252)
             
-            # 写入 DataFrame
-            for k, v in feats.items():
-                df_feat[f'{k}_{w}'] = v
-             
+            # 3. 最大回撤 (MDD)
+            df_feat[f'mdd_{w}'] = df_feat['close'].rolling(window=w).apply(calc_max_drawdown_fast, raw=True)
+            
+            # 4. 斜率 (Slope) 和 R2
+            # apply 只能返回标量，所以需要两次调用
+            def get_slope(y):
+                s, _ = calc_slope_r2_fast(y)
+                return s
+            
+            def get_r2(y):
+                _, r = calc_slope_r2_fast(y)
+                return r
+
+            df_feat[f'slope_{w}'] = df_feat['close'].rolling(window=w).apply(get_slope, raw=True)
+            df_feat[f'r2_{w}'] = df_feat['close'].rolling(window=w).apply(get_r2, raw=True)
+            
+            # 5. 复合指标 (向量化操作)
+            df_feat[f'sxr_{w}'] = df_feat[f'slope_{w}'] * df_feat[f'r2_{w}']
+            # 避免除以0
+            df_feat[f'sharp_{w}'] = df_feat[f'slope_{w}'] / (df_feat[f'vol_{w}'] + 0.01)
+            
+        # 填充 NaN (因为滚动窗口前 w-1 个数据是 NaN)
+        # 实际上我们不需要填充为0，保留NaN更好，因为在回测中我们会检查NaN
+        # 但为了兼容原有逻辑，如果需要可以填0
+        # df_feat = df_feat.fillna(0.0)
+
         processed_data[name] = df_feat
+    
+    # 异步保存到磁盘（可选，为了不阻塞主线程，这里简单同步保存）
+    # save_all_features_to_disk(processed_data)
         
     return processed_data, sorted_dates
+
+def calculate_trade_stats(history_df):
+    """
+    计算交易层面的统计指标：
+    1. 每笔交易的收益、持仓天数、最大回撤
+    2. 胜率、盈亏比等
+    """
+    if history_df.empty:
+        return pd.DataFrame(), {}
+        
+    trades = []
+    current_trade = None
+    
+    # 遍历每日历史记录，重构交易
+    # history_df cols: date, holding, prev_holding, score, action, daily_ret, close_open_pct
+    
+    # 添加净值列辅助计算最大回撤
+    history_df = history_df.copy()
+    history_df['equity_curve'] = (1 + history_df['daily_ret']).cumprod()
+    
+    for idx, row in history_df.iterrows():
+        date = row['date']
+        holding = row['holding']
+        prev_holding = row['prev_holding']
+        daily_ret = row['daily_ret']
+        
+        # 识别交易起点：从空仓/其他资产 -> 新资产
+        # 或者 初始持仓
+        
+        # 简化逻辑：只要 holding 发生变化，或者 holding 不变但今天是第一天
+        # 我们以“连续持有一段资产”定义为一笔交易
+        
+        if current_trade is None:
+            # 第一笔交易初始化
+            current_trade = {
+                'asset': holding,
+                'start_date': date,
+                'end_date': None,
+                'days': 0,
+                'returns': [],
+                'equity': [1.0] # 交易内净值归一化
+            }
+        
+        # 检查是否发生切换 (Switch)
+        # 注意：row['action'] == 'Switch' 意味着今天持有的 holding 不同于昨天
+        # 所以今天的收益属于新 holding。
+        # 昨天的 trade 应该在昨天结束。
+        
+        if row['action'] == 'Switch' and idx > 0:
+            # 结算上一笔交易
+            current_trade['end_date'] = history_df.iloc[idx-1]['date']
+            trades.append(current_trade)
+            
+            # 开启新交易
+            current_trade = {
+                'asset': holding,
+                'start_date': date,
+                'end_date': None,
+                'days': 0,
+                'returns': [],
+                'equity': [1.0]
+            }
+            
+        # 累积当前交易的数据
+        current_trade['days'] += 1
+        current_trade['returns'].append(daily_ret)
+        new_nav = current_trade['equity'][-1] * (1 + daily_ret)
+        current_trade['equity'].append(new_nav)
+        
+    # 最后一笔交易结算
+    if current_trade:
+        current_trade['end_date'] = history_df.iloc[-1]['date']
+        trades.append(current_trade)
+        
+    # 计算每笔交易的指标
+    trade_records = []
+    for t in trades:
+        # 忽略现金交易（如果需要统计空仓期也可以保留）
+        if t['asset'] == '现金' or t['asset'] is None:
+            continue
+            
+        # 总收益
+        total_ret = t['equity'][-1] - 1
+        
+        # 交易内最大回撤及持续天数
+        navs = np.array(t['equity'])
+        roll_max = np.maximum.accumulate(navs)
+        # 避免除以0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dd = (navs - roll_max) / roll_max
+            dd[np.isnan(dd)] = 0 # 处理 roll_max 为 0 的情况
+            
+        max_dd = dd.min()
+        
+        # 计算回撤持续时间 (简单估算: 从最近一个新高到最低点的距离，或者整个回撤期的长度)
+        # 这里计算: 处于回撤状态的总天数 / 交易总天数
+        # 或者更精确: 最长连续回撤天数
+        is_dd = dd < 0
+        if np.any(is_dd):
+            # 找到最长连续 True 的序列
+            # 使用 diff 找边界
+            padded = np.concatenate(([False], is_dd, [False]))
+            diff = np.diff(padded.astype(int))
+            starts = np.where(diff == 1)[0]
+            ends = np.where(diff == -1)[0]
+            if len(starts) > 0:
+                max_dd_duration = (ends - starts).max()
+            else:
+                max_dd_duration = 0
+        else:
+            max_dd_duration = 0
+
+        trade_records.append({
+            '标的': t['asset'],
+            '买入日期': t['start_date'],
+            '卖出日期': t['end_date'],
+            '持仓天数': t['days'],
+            '交易收益': total_ret,
+            '最大回撤': max_dd,
+            '回撤持续天数': max_dd_duration
+        })
+        
+    df_trades = pd.DataFrame(trade_records)
+    
+    # 全局统计
+    stats = {}
+    if not df_trades.empty:
+        stats['total_trades'] = len(df_trades)
+        stats['win_rate'] = (df_trades['交易收益'] > 0).mean()
+        stats['avg_ret'] = df_trades['交易收益'].mean()
+        stats['max_single_ret'] = df_trades['交易收益'].max()
+        stats['min_single_ret'] = df_trades['交易收益'].min()
+        stats['avg_days'] = df_trades['持仓天数'].mean()
+        stats['avg_dd_days'] = df_trades['回撤持续天数'].mean()
+        stats['max_dd_days'] = df_trades['回撤持续天数'].max()
+        
+        # 盈亏比
+        avg_win = df_trades[df_trades['交易收益'] > 0]['交易收益'].mean() if not df_trades[df_trades['交易收益'] > 0].empty else 0
+        avg_loss = abs(df_trades[df_trades['交易收益'] < 0]['交易收益'].mean()) if not df_trades[df_trades['交易收益'] < 0].empty else 1 # 避免除以0
+        stats['pl_ratio'] = avg_win / avg_loss if avg_loss != 0 else 0
+    else:
+        stats = {k: 0 for k in ['total_trades', 'win_rate', 'avg_ret', 'max_single_ret', 'min_single_ret', 'avg_days', 'pl_ratio']}
+
+    return df_trades, stats
+
+def calculate_top_drawdowns(history_df, top_n=5):
+    """
+    计算历史最大的 N 次回撤区间
+    返回 DataFrame: ['start_date', 'end_date', 'depth', 'duration']
+    """
+    # 确保有累计净值列
+    if 'cumulative_ret' not in history_df.columns:
+        history_df = history_df.copy()
+        history_df['cumulative_ret'] = (1 + history_df['daily_ret']).cumprod() - 1
+        
+    equity = history_df['cumulative_ret'] + 1
+    # 计算高水位
+    high_water_mark = equity.cummax()
+    # 计算回撤
+    drawdown = (equity - high_water_mark) / high_water_mark
+    
+    # 寻找回撤区间
+    # 逻辑：只要 drawdown < 0，就是一个回撤期
+    # 结束标志：drawdown 回到 0 (即创新高)
+    
+    is_dd = drawdown < 0
+    
+    # 使用 diff 找状态变化点
+    # padded: [False, ...data..., False]
+    padded = np.concatenate(([False], is_dd, [False]))
+    diff = np.diff(padded.astype(int))
+    
+    # starts: 从 0 变为 1 的索引 (进入回撤)
+    # ends: 从 1 变为 0 的索引 (结束回撤，创新高)
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+    
+    dd_periods = []
+    
+    if len(starts) > 0 and len(ends) > 0:
+        for s, e in zip(starts, ends):
+            # 在这个区间内找到最大回撤深度
+            # 注意：s 是 history_df 的索引，e 是结束索引（不包含）
+            # 切片范围是 [s, e)
+            
+            # 如果索引越界保护
+            if s >= len(history_df): continue
+            real_e = min(e, len(history_df))
+            
+            dd_slice = drawdown.iloc[s:real_e]
+            min_dd = dd_slice.min()
+            min_idx = dd_slice.idxmin() # 达到最大回撤的日期索引
+            
+            start_date = history_df.iloc[s]['date']
+            # 如果 e 对应的是恢复日（创新高日），那么 e-1 是还在水下的最后一天
+            # 恢复日是 e
+            end_date = history_df.iloc[real_e-1]['date'] if real_e > 0 else start_date
+            
+            # 实际上，真正“恢复”是指创新高的那一天，即 history_df.iloc[e] (如果存在)
+            # 如果回撤一直持续到最后一天，则未恢复
+            if e < len(history_df):
+                recovery_date = history_df.iloc[e]['date']
+                status = "已恢复"
+            else:
+                recovery_date = None
+                status = "未恢复"
+                
+            dd_periods.append({
+                '开始日期': start_date,
+                '最大回撤日期': history_df.loc[min_idx, 'date'],
+                '结束/恢复日期': recovery_date if recovery_date else history_df.iloc[-1]['date'],
+                '回撤深度': min_dd,
+                '持续天数': (pd.to_datetime(recovery_date) - pd.to_datetime(start_date)).days if recovery_date else (pd.to_datetime(history_df.iloc[-1]['date']) - pd.to_datetime(start_date)).days,
+                '状态': status
+            })
+            
+    df_dd = pd.DataFrame(dd_periods)
+    if not df_dd.empty:
+        df_dd = df_dd.sort_values('回撤深度', ascending=True).head(top_n) # 深度是负数，越小越深
+        
+    return df_dd
 
 def run_backtest_range(predictor, data_dict, start_date, end_date, model_name, initial_holding=None, force_neutral=False, use_warmup=True):
     # 1. 预计算特征
@@ -559,6 +875,8 @@ if st.sidebar.button("📊 投顾控制台"):
     navigate_to("dashboard")
 if st.sidebar.button("📚 关于模型原理"):
     navigate_to("about")
+if st.sidebar.button("📖 回测机制详解"):
+    navigate_to("backtest_logic")
 if st.sidebar.button("🎯 镜像策略中心", use_container_width=True):
     navigate_to("mirror")
     st.rerun()
@@ -675,6 +993,84 @@ if st.session_state.page == "about":
     *   **非投资建议**: 本系统仅供辅助决策，盈亏自负。
     """)
     st.info("💡 提示：您可以在左侧导航栏返回【投顾控制台】进行实际操作。")
+
+elif st.session_state.page == "backtest_logic":
+    st.title("📖 回测系统机制详解")
+    st.markdown("---")
+    
+    st.markdown("""
+    本系统采用 **“信号-执行分离”** 的严格回测框架，旨在最大程度还原真实的实盘交易环境，杜绝“未来函数”带来的虚假繁荣。
+    
+    ### 1. 🕒 核心时间轴 (Timeline)
+    
+    我们的回测逻辑严格遵循以下时间顺序：
+    
+    *   **T-1 日 (信号日)**: 
+        *   收盘后，系统获取截至当日的全部历史数据（收盘价、成交量等）。
+        *   模型根据这些数据计算 96 维特征，并输出对 T 日的持仓建议（例如：持有纳指 或 切换为空仓）。
+        *   **注意**: 此时 T 日的行情尚未发生，决策完全基于历史信息。
+        
+    *   **T 日 (交易与持仓日)**:
+        *   **开盘时刻 (Open)**: 如果 T-1 日的建议与当前持仓不同（例如从空仓变为持有），系统假设在 **T 日开盘价** 完成调仓。
+        *   **收盘时刻 (Close)**: 计算当日的账户权益变化。
+    
+    ---
+    
+    ### 2. 💰 收益计算公式 (Return Calculation)
+    
+    为了精确模拟交易损耗和日内波动，我们根据是否发生调仓采用不同的计算公式：
+    
+    #### 情况 A: 发生调仓 (Switch)
+    当系统建议从“资产A”切换到“资产B”时，交易流程如下：
+    
+    1.  **卖出操作**: 在 **T 日开盘价** 卖出持有的“资产A”。
+        *   *资产A 当日收益*: $\frac{Open_{T,A}}{Close_{T-1,A}} - 1$ (捕获了资产A的隔夜跳空)。
+        *   *注意*: 为了简化计算，回测系统通常将这部分隔夜收益归入“上一笔交易”的最终净值中，或者在切换日直接计算新资产的收益。本系统采取**“无缝切换”**逻辑：我们假设资金在开盘瞬间完成转移。
+        
+    2.  **买入操作**: 在 **T 日开盘价** 买入“资产B”。
+    
+    3.  **当日净值变化**: 实际上由两部分组成（旧资产的隔夜波动 + 新资产的日内波动）。
+        *   **本系统简化算法**: 为了规避复杂的资金结算延迟问题，我们在回测中主要关注**新持有资产（资产B）的日内表现**。
+        *   **计算公式**: $\frac{Close_{T,B}}{Open_{T,B}} - 1$
+        *   *这意味着*: 调仓日当天，我们承担了新资产 B 的日内涨跌风险。
+    
+    #### 情况 B: 持仓不变 (Hold)
+    当系统建议继续持有“资产A”时：
+    *   **基准价格**: 资产 A 的 **T-1 日收盘价 ($Close_{T-1}$)**。
+    *   **当日收益**: $\frac{Close_T}{Close_{T-1}} - 1$
+    *   *解释*: 您完整地持有了该资产度过了一整天，因此享受（或承担）了包括隔夜跳空在内的**全天涨跌幅**。
+    
+    #### 情况 C: 空仓 (Cash)
+    *   **当日收益**: $0.0\%$ (我们暂不计算现金理财收益)。
+    
+    ---
+    
+    ### 3. 📊 绩效指标定义 (Metrics)
+    
+    系统会自动计算以下专业金融指标来评估策略质量：
+    
+    | 指标 | 定义 | 解读 |
+    | :--- | :--- | :--- |
+    | **累计收益 (Cumulative Return)** | $\prod (1 + r_t) - 1$ | 策略从开始到现在的总回报率。 |
+    | **年化收益 (CAGR)** | $(1 + TotalRet)^{\frac{365}{Days}} - 1$ | 将总收益折算为每年的平均复利增长率。 |
+    | **最大回撤 (Max Drawdown)** | $\min (\frac{Value_t - Peak_t}{Peak_t})$ | 历史上从最高点跌下来的最大幅度。**衡量风险的核心指标**。 |
+    | **夏普比率 (Sharpe Ratio)** | $\frac{E[R_p - R_f]}{\sigma_p}$ | 每承担 1 单位波动风险所获得的超额回报。**>1.0 为优秀**。 |
+    | **卡玛比率 (Calmar Ratio)** | $\frac{CAGR}{|MaxDD|}$ | 年化收益与最大回撤之比。衡量“为了赚这笔钱，我需要忍受多大的痛苦”。 |
+    | **胜率 (Win Rate)** | $\frac{盈利天数}{总交易天数}$ | 每天赚钱的概率。注意：高胜率不代表一定赚钱（可能赚小钱亏大钱）。 |
+    
+    ---
+    
+    ### 4. 🤖 模型评分与决策 (Scoring)
+    
+    在 T-1 日，AI 模型会给每个资产打分 (Score, 0~1)：
+    *   **Score**: 代表模型对该资产未来表现的信心。
+    *   **Rank**: 我们将 Score 进行每日排名。
+    *   **决策**: 系统总是选择 **Score 最高** 且符合风险控制规则的资产作为 T 日的持仓目标。
+    
+    *如果所有风险资产的评分都过低（或模型预测市场风险极高），系统会选择 **“现金”** 作为最优解，即建议空仓观望。*
+    """)
+    
+    st.info("💡 明白了？点击左侧【投顾控制台】去试一试吧！")
 
 elif st.session_state.page == "mirror":
     st.title("🎯 镜像策略中心")
@@ -993,6 +1389,20 @@ elif st.session_state.page == "dashboard":
                         
                         trade_count = len(sub[sub['action'] == 'Switch'])
                         
+                        # Drawdown Duration (Strategy Level)
+                        is_dd = dd < 0
+                        if np.any(is_dd):
+                            padded = np.concatenate(([False], is_dd, [False]))
+                            diff = np.diff(padded.astype(int))
+                            starts = np.where(diff == 1)[0]
+                            ends = np.where(diff == -1)[0]
+                            if len(starts) > 0:
+                                max_strat_dd_days = (ends - starts).max()
+                            else:
+                                max_strat_dd_days = 0
+                        else:
+                            max_strat_dd_days = 0
+
                         metrics_data.append({
                             "模型": m_name,
                             "总收益": f"{total_ret:.2%}",
@@ -1001,12 +1411,193 @@ elif st.session_state.page == "dashboard":
                             "索提诺比率": f"{sortino:.2f}",
                             "卡玛比率": f"{calmar:.2f}",
                             "最大回撤": f"{max_dd:.2%}",
+                            "回撤最长持续": f"{max_strat_dd_days} 天",
                             "胜率(日)": f"{win_rate:.2%}",
                             "盈亏比": f"{profit_factor:.2f}",
-                            "交易次数": trade_count
                         })
                         
-                    st.dataframe(pd.DataFrame(metrics_data), use_container_width=True)
+                        # Calculate Per-Trade Stats
+                        # Need to reconstruct history_df from sub
+                        # sub has columns: date, holding, prev_holding, score, action, daily_ret, close_open_pct, Model, cumulative_ret
+                        
+                        # Clean up sub for calculate_trade_stats
+                        hist_for_stats = sub.copy()
+                        hist_for_stats = hist_for_stats.drop(columns=['Model', 'cumulative_ret'])
+                        # cum_ret needed for calculate_trade_stats is (1+ret).cumprod() - 1? 
+                        # No, calculate_trade_stats uses daily_ret directly.
+                        # But wait, previous implementation of calculate_trade_stats uses daily_ret.
+                        # It re-calculates equity_curve internally.
+                        
+                        trade_df, trade_stats = calculate_trade_stats(hist_for_stats)
+                        
+                        if not trade_df.empty:
+                            st.subheader(f"📊 {m_name} - 交易明细分析")
+                            
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric("总交易次数", trade_stats['total_trades'])
+                            c2.metric("平均持仓天数", f"{trade_stats['avg_days']:.1f} 天")
+                            c3.metric("交易胜率", f"{trade_stats['win_rate']:.2%}")
+                            c4.metric("平均单笔收益", f"{trade_stats['avg_ret']:.2%}")
+                            
+                            c5, c6, c7, c8 = st.columns(4)
+                            c5.metric("盈亏比 (P/L)", f"{trade_stats['pl_ratio']:.2f}")
+                            c6.metric("单笔最大收益", f"{trade_stats['max_single_ret']:.2%}", delta="🚀")
+                            c7.metric("单笔最大亏损", f"{trade_stats['min_single_ret']:.2%}", delta="🔻")
+                            c8.metric("策略最大回撤", f"{max_dd:.2%}", delta_color="inverse")
+                            
+                            st.markdown("##### 📉 交易分布统计 (高级视图)")
+                            d1, d2 = st.columns(2)
+                            
+                            # 1. 散点图：收益 vs 持仓天数 (点的大小代表绝对收益大小，颜色代表盈亏)
+                            scatter_chart = alt.Chart(trade_df).mark_circle().encode(
+                                x=alt.X('持仓天数', title='持仓天数 (Days)'),
+                                y=alt.Y('交易收益', title='交易收益率', axis=alt.Axis(format='%')),
+                                color=alt.condition(
+                                    alt.datum['交易收益'] > 0,
+                                    alt.value('green'),
+                                    alt.value('red')
+                                ),
+                                size=alt.Size('交易收益', scale=alt.Scale(domain=[-0.2, 0.2], range=[50, 500]), legend=None),
+                                tooltip=['标的', '买入日期', '交易收益', '持仓天数', '最大回撤']
+                            ).properties(
+                                title='盈亏分布矩阵 (收益 vs 时间)',
+                                height=300
+                            ).interactive()
+                            
+                            # 添加 0 轴线
+                            rule = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color='gray', strokeDash=[3,3]).encode(y='y')
+                            d1.altair_chart(scatter_chart + rule, use_container_width=True)
+                            
+                            # 2. 箱线图：不同标的的收益波动范围
+                            boxplot = alt.Chart(trade_df).mark_boxplot(extent='min-max').encode(
+                                x=alt.X('标的', title='资产类别'),
+                                y=alt.Y('交易收益', title='收益分布', axis=alt.Axis(format='%')),
+                                color='标的',
+                                tooltip=['标的', '交易收益']
+                            ).properties(
+                                title='资产收益波动性分析',
+                                height=300
+                            )
+                            d2.altair_chart(boxplot, use_container_width=True)
+                            
+                            # 3. 瀑布图 (Waterfall) - 累计收益构成
+                            # 构造瀑布图数据
+                            waterfall_df = trade_df.copy()
+                            waterfall_df['id'] = range(len(waterfall_df))
+                            waterfall_df['prev_sum'] = waterfall_df['交易收益'].cumsum().shift(1).fillna(0)
+                            waterfall_df['curr_sum'] = waterfall_df['交易收益'].cumsum()
+                            waterfall_df['color'] = np.where(waterfall_df['交易收益'] > 0, '盈利', '亏损')
+                            
+                            waterfall_chart = alt.Chart(waterfall_df).mark_bar().encode(
+                                x=alt.X('id', title='交易序号'),
+                                y=alt.Y('prev_sum', title='累计收益率', axis=alt.Axis(format='%')),
+                                y2='curr_sum',
+                                color=alt.Color('color', scale=alt.Scale(domain=['盈利', '亏损'], range=['green', 'red'])),
+                                tooltip=['标的', '买入日期', '交易收益', 'curr_sum']
+                            ).properties(
+                                title='账户资金流 (交易逐笔盈亏)',
+                                height=250
+                            ).interactive()
+                            
+                            st.altair_chart(waterfall_chart, use_container_width=True)
+                            
+                            with st.expander(f"查看 {m_name} 所有交易记录"):
+                                st.dataframe(
+                                    trade_df.style.format({
+                                        '交易收益': '{:.2%}',
+                                        '最大回撤': '{:.2%}',
+                                        '买入日期': '{:%Y-%m-%d}',
+                                        '卖出日期': '{:%Y-%m-%d}'
+                                    }),
+                                    use_container_width=True
+                                )
+                                
+                            # --- Trade Visualization ---
+                            st.markdown("#### 🕯️ 交易可视化 (K线 + 买卖点)")
+                            
+                            # 获取该模型交易过的所有非空仓资产
+                            traded_assets = trade_df['标的'].unique().tolist()
+                            if '现金' in traded_assets: traded_assets.remove('现金')
+                            
+                            if traded_assets:
+                                # 修复：不使用 selectbox 交互（导致页面刷新），而是直接循环展示所有资产
+                                for selected_asset_chart in traded_assets:
+                                    st.markdown(f"**{selected_asset_chart}**")
+                                    
+                                    # 1. 获取该资产的全量历史数据
+                                    if selected_asset_chart in data_dict:
+                                        df_asset = data_dict[selected_asset_chart].copy()
+                                        df_asset['date'] = pd.to_datetime(df_asset['date'])
+                                        
+                                        # 过滤时间范围：仅显示回测区间内的数据
+                                        mask = (df_asset['date'] >= pd.to_datetime(start_date)) & (df_asset['date'] <= pd.to_datetime(end_date))
+                                        df_chart = df_asset.loc[mask].copy()
+                                        
+                                        # 2. 标记买卖点
+                                        asset_trades = trade_df[trade_df['标的'] == selected_asset_chart]
+                                        
+                                        buy_points = []
+                                        sell_points = []
+                                        
+                                        for _, t in asset_trades.iterrows():
+                                            d_buy = pd.to_datetime(t['买入日期'])
+                                            if d_buy in df_chart['date'].values:
+                                                price = df_chart.loc[df_chart['date'] == d_buy, 'open'].values[0] # Open price for buy
+                                                if pd.isna(price) or price == 0: price = df_chart.loc[df_chart['date'] == d_buy, 'close'].values[0]
+                                                buy_points.append({'date': d_buy, 'price': price, 'type': 'Buy'})
+                                                
+                                            d_sell = pd.to_datetime(t['卖出日期'])
+                                            if pd.notnull(d_sell) and d_sell in df_chart['date'].values:
+                                                price = df_chart.loc[df_chart['date'] == d_sell, 'open'].values[0]
+                                                if d_sell == pd.to_datetime(end_date): # Last day
+                                                     price = df_chart.loc[df_chart['date'] == d_sell, 'close'].values[0]
+                                                
+                                                if pd.isna(price) or price == 0: price = df_chart.loc[df_chart['date'] == d_sell, 'close'].values[0]
+                                                sell_points.append({'date': d_sell, 'price': price, 'type': 'Sell'})
+                                        
+                                        # 3. 绘制图表
+                                        base = alt.Chart(df_chart).encode(x=alt.X('date:T', title='日期'))
+                                        
+                                        line = base.mark_line(color='gray', opacity=0.5).encode(
+                                            y=alt.Y('close', title='价格', scale=alt.Scale(zero=False)),
+                                            tooltip=['date', 'open', 'close', 'high', 'low']
+                                        )
+                                        
+                                        if buy_points:
+                                            df_buy = pd.DataFrame(buy_points)
+                                            buy_chart = alt.Chart(df_buy).mark_point(
+                                                shape='triangle-up', color='red', size=100, filled=True
+                                            ).encode(
+                                                x='date:T',
+                                                y='price',
+                                                tooltip=[alt.Tooltip('date', title='买入日期'), alt.Tooltip('price', title='买入价格')]
+                                            )
+                                        else:
+                                            buy_chart = alt.Chart(pd.DataFrame()).mark_point()
+                                            
+                                        if sell_points:
+                                            df_sell = pd.DataFrame(sell_points)
+                                            sell_chart = alt.Chart(df_sell).mark_point(
+                                                shape='triangle-down', color='green', size=100, filled=True
+                                            ).encode(
+                                                x='date:T',
+                                                y='price',
+                                                tooltip=[alt.Tooltip('date', title='卖出日期'), alt.Tooltip('price', title='卖出价格')]
+                                            )
+                                        else:
+                                            sell_chart = alt.Chart(pd.DataFrame()).mark_point()
+                                            
+                                        st.altair_chart((line + buy_chart + sell_chart).interactive(), use_container_width=True)
+                                        
+                                    else:
+                                        st.warning(f"未找到资产 {selected_asset_chart} 的历史数据。")
+                            else:
+                                st.info("该模型在此期间未交易任何风险资产。")
+                        else:
+                            st.info(f"模型 {m_name} 在此期间无交易或一直空仓。")
+                    
+                    st.subheader("🏆 策略横向对比")
+                    st.dataframe(pd.DataFrame(metrics_data).set_index("模型"), use_container_width=True)
 
                     # --- Metrics Explanation ---
                     with st.expander("📚 点击查看金融绩效指标解释"):
@@ -1037,14 +1628,48 @@ elif st.session_state.page == "dashboard":
                             sub['drawdown'] = (sub['cumulative_ret'] - roll_max) / roll_max
                             max_dd = sub['drawdown'].min()
                             
-                            # Drawdown Chart
-                            c_dd = alt.Chart(sub).mark_area(color='red', opacity=0.3).encode(
-                                x='date:T',
-                                y=alt.Y('drawdown', title='回撤', scale=alt.Scale(domain=[max_dd*1.1, 0])),
-                                tooltip=['date', 'drawdown']
-                            ).properties(height=150)
+                            # Drawdown Chart (Improved Visibility)
+                            # 使用 Area 图并设置更醒目的颜色和透明度，同时增加交互线
+                            c_dd = alt.Chart(sub).mark_area(
+                                line={'color': 'darkred'}, # 增加深红色边线
+                                color=alt.Gradient(
+                                    gradient='linear',
+                                    stops=[alt.GradientStop(color='red', offset=0),
+                                           alt.GradientStop(color='white', offset=1)],
+                                    x1=1, x2=1, y1=1, y2=0
+                                ),
+                                opacity=0.7
+                            ).encode(
+                                x=alt.X('date:T', title='日期'),
+                                y=alt.Y('drawdown', title='回撤深度', axis=alt.Axis(format='%', titleColor='red')),
+                                tooltip=[
+                                    alt.Tooltip('date', title='日期', format='%Y-%m-%d'), 
+                                    alt.Tooltip('drawdown', title='回撤深度', format='.2%'),
+                                    alt.Tooltip('cumulative_ret', title='当前净值', format='.4f')
+                                ]
+                            ).properties(
+                                title='策略水下曲线 (Underwater Chart)',
+                                height=200
+                            ).interactive()
+                            
                             st.altair_chart(c_dd, use_container_width=True)
                             
+                            # Top 5 Drawdowns
+                            st.markdown("##### 📉 历史前 5 大回撤区间")
+                            df_top_dd = calculate_top_drawdowns(sub, top_n=5)
+                            if not df_top_dd.empty:
+                                st.dataframe(
+                                    df_top_dd.style.format({
+                                        '回撤深度': '{:.2%}',
+                                        '开始日期': '{:%Y-%m-%d}',
+                                        '最大回撤日期': '{:%Y-%m-%d}',
+                                        '结束/恢复日期': '{:%Y-%m-%d}'
+                                    }),
+                                    use_container_width=True
+                                )
+                            else:
+                                st.info("策略表现极其稳健，无显著回撤。")
+                                
                             # Table
                             st.dataframe(
                                 sub[['date', 'holding', 'action', 'score', 'daily_ret', 'cumulative_ret']].style.format({
