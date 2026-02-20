@@ -1079,7 +1079,7 @@ elif st.session_state.page == "mirror":
     
     # 使用 iframe 嵌入镜像网站，用户在地址栏只能看到当前网站的 URL
     # 这实现了“隐藏真实地址”的需求
-    st.components.v1.iframe("https://168.unicornhunter.cn/", height=1000, scrolling=True)
+    st.components.v1.iframe("https://168.nbjiadao.com/", height=1000, scrolling=True)
 
 elif st.session_state.page == "dashboard":
     # Mode Selection
