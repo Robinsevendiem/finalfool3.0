@@ -73,9 +73,17 @@ NAME_MAP = {
     '518880.SH': '黄金ETF',
     '511090.SH': '30年国债',
     '161129.SZ': '南方原油',
-    '501018.SH': '南方原油'
+    '501018.SH': '南方原油',
+    '513020.SH': '港股科技'
 }
 VALID_ASSETS = list(set(NAME_MAP.values()))
+
+# 创建一个名称到代码的映射，用于反向查找
+# 注意：如果有多个代码对应同一个名称（如科创板、南方原油），这里默认取第一个找到的。
+# 在显示时，我们更倾向于显示数据源中实际使用的代码。
+NAME_TO_CODE = {}
+# 为了保证主要代码优先，我们可以手动指定或依赖遍历顺序。
+# 这里简单处理，后续在显示时会从数据源中获取真实代码。
 
 # --- Helper Functions ---
 
@@ -86,6 +94,12 @@ def load_market_data():
     
     # Sort filenames to ensure deterministic loading order across platforms
     filenames = sorted([f for f in os.listdir(DATA_DIR) if f.endswith('.csv')])
+    
+    # 我们需要在函数内部维护一个局部的映射，然后返回它，或者使用 session_state
+    # 但 @st.cache_data 的函数应该是纯函数，不应该修改外部全局变量。
+    # 修改：让 load_market_data 返回 (data, name_to_code) 元组
+    
+    local_name_to_code = {}
     
     for filename in filenames:
         code = filename.split('_')[0]
@@ -106,19 +120,19 @@ def load_market_data():
                 df['name'] = name
                 df['code'] = code
                 
-                # 如果同一个资产名称对应多个文件（如 588120 和 588000 都是科创板），
-                # 我们需要一个确定的逻辑来选择，避免在 Streamlit 上加载了不同的文件。
-                # 逻辑：优先选择代码在 NAME_MAP 中靠前的，或者数据量更多的。
+                # 记录映射
+                if name not in local_name_to_code:
+                    local_name_to_code[name] = code
+                
                 if name in data:
-                    # 如果当前文件的代码在映射表中更早出现，或者数据更长，则替换
-                    existing_code = data[name]['code'].iloc[0]
                     if len(df) > len(data[name]):
                         data[name] = df
                 else:
                     data[name] = df
         except Exception as e:
             print(f"Error loading {filename}: {e}")
-    return data
+            
+    return data, local_name_to_code
 
 @st.cache_resource(show_spinner=False)
 def load_model(path=None):
@@ -140,6 +154,60 @@ def load_model(path=None):
         # 在 Streamlit UI 中显示错误，方便排查
         st.error(f"模型文件加载失败 ({target_path}): {e}")
         return None
+
+def calculate_thermometer(df):
+    """
+    计算策略净值的温度计指标
+    输入 df 需包含 'close', 'high', 'low' 列（如果是净值曲线，这三者可以相同）
+    """
+    # 1. 计算价格源 hlcc4
+    # 如果只有 close (净值)，则 high=low=close
+    if 'high' not in df.columns: df['high'] = df['close']
+    if 'low' not in df.columns: df['low'] = df['close']
+        
+    src = (df['high'] + df['low'] + df['close'] * 2) / 4 
+    
+    # 2. 计算 RSI (采用 RMA 平滑) 
+    def rma(series, period): 
+        return series.ewm(alpha=1/period, adjust=False).mean() 
+    
+    delta = src.diff() 
+    up = rma(delta.clip(lower=0), 14) 
+    down = rma(-delta.clip(upper=0), 14) 
+    # 避免除以0
+    down = down.replace(0, 1e-10)
+    rsi = 100 - (100 / (1 + up / down)) 
+    
+    # 3. 计算 TSI (价格与时间的相关系数) 
+    # Pandas rolling corr 需要两个序列。
+    # 我们构造一个简单的 index 序列作为时间轴
+    # 注意：rolling corr 在早期 pandas 版本可能行为不同，这里假设是标准的 pearson 相关系数
+    time_idx = pd.Series(np.arange(len(df)), index=df.index)
+    tsi = src.rolling(window=14).corr(time_idx)
+    # 将相关系数 [-1, 1] 映射到 [0, 100]
+    tsi_norm = (tsi + 1) / 2 * 100 
+    
+    # 4. 计算 BB%B (布林带百分比) 
+    sma_bb = src.rolling(window=20).mean() 
+    std_bb = src.rolling(window=20).std(ddof=0) # 布林带通常用总体标准差或样本标准差？一般用 ddof=0
+    # 避免除以0
+    std_bb = std_bb.replace(0, 1e-10)
+    
+    upper = sma_bb + 2 * std_bb
+    lower = sma_bb - 2 * std_bb
+    
+    # %B = (Price - Lower) / (Upper - Lower)
+    # Upper - Lower = 4 * std
+    bb_percent = (src - lower) / (4 * std_bb) * 100 
+    bb_percent = bb_percent.clip(0, 100) # 限制在 0-100
+    
+    # 5. 最终加权合成 
+    thermometer = (rsi * 0.45) + (tsi_norm * 0.26) + (bb_percent * 0.29) 
+    
+    # 6. (可选) 3日SMA平滑 
+    plot_line = thermometer.rolling(window=3).mean() 
+    
+    return thermometer, plot_line
 
 @st.cache_data
 def calc_max_drawdown(prices):
@@ -825,7 +893,13 @@ if not os.path.exists(os.path.join(MODEL_PATH, 'predictor.pkl')):
 
 # Load Resources First to get model names
 with st.spinner("正在加载模型与数据..."):
-    data_dict = load_market_data()
+    # 修改：解包返回值
+    data_dict, loaded_codes = load_market_data()
+    
+    # 将加载到的代码更新到全局映射中（或 session_state）
+    # 也可以直接更新 NAME_TO_CODE，虽然这不太符合 React 模式，但简单有效
+    NAME_TO_CODE.update(loaded_codes)
+    
     try:
         # 先检查核心文件是否存在，再进入缓存加载，避免缓存了错误的结果
         predictor_file = os.path.join(MODEL_PATH, 'predictor.pkl')
@@ -931,11 +1005,34 @@ if st.session_state.page == "about":
     
     1.  **原始数据**: `Open, High, Low, Close, Volume` (每日更新)
         ⬇️
-    2.  **特征工程**: 计算 `Ret`, `Slope`, `R2`, `MaxDD`, `Vol` (8个时间窗口)
+    2.  **特征工程**: 
+        *   **基础指标**: 3/5/10/20...120日 收益率、波动率、最大回撤。
+        *   **高级指标**: 线性回归斜率 (Slope)、R平方 (R2)、夏普比率 (Sharpe)。
+        *   **市场情绪**: 市场整体热度、连涨天数等。
         ⬇️
-    3.  **模型预测**: 输入特征矩阵 -> 多个模型并行打分 -> 加权集成
+    3.  **模型预测**: 输入特征矩阵 -> 输出各资产得分 (Score) -> 排序 (Rank)。
         ⬇️
-    4.  **最终决策**: 输出 Score (0~1) -> 结合当前持仓生成操作指令 (买入/卖出/调仓)
+    4.  **交易执行**: 
+        *   如果 Top 1 资产得分 > 阈值，全仓买入/切换。
+        *   如果所有资产得分低迷，空仓观望（持有现金）。
+        
+    ---
+    
+    ### 🎯 策略标的池 (Asset Pool)
+    
+    本策略精选了全球大类资产中的核心 ETF 作为交易标的，旨在通过**全球轮动**捕捉结构性机会：
+    
+    | 资产名称 | 证券代码 | 投资领域 |
+    | :--- | :--- | :--- |
+    | **黄金 ETF** | `518880.SH` | 大宗商品 / 避险资产 |
+    | **日经 ETF** | `513520.SH` | 日本股市 (发达市场) |
+    | **纳指 100** | `513100.SH` | 美国科技股 (全球成长核心) |
+    | **港股科技** | `513020.SH` | 香港科技股 (中国资产离岸) |
+    | **上证 180** | `510180.SH` | A股核心蓝筹 |
+    | **30年国债** | `511090.SH` | 超长期利率债 / 防御资产 |
+    | **科创板** | `588120.SH` | 中国硬科技 |
+    | **创业板** | `159915.SZ` | 中国成长股 |
+    | **南方原油** | `501018.SH` | 能源 / 通胀对冲 |
     
     ---
     
@@ -1153,6 +1250,10 @@ elif st.session_state.page == "dashboard":
                     top_name = top_cand['name']
                     top_score = top_cand['score']
                     
+                    # 获取代码后缀
+                    top_code = NAME_TO_CODE.get(top_name, "")
+                    top_name_display = f"{top_name} ({top_code})" if top_code else top_name
+                    
                     # Logic
                     action_color = "green"
                     action_text = ""
@@ -1164,7 +1265,7 @@ elif st.session_state.page == "dashboard":
                             action_color = "gray"
                             reason_text = "市场风险较高，主模型认为持有现金是最优解。"
                         else:
-                            action_text = f"✅ 建议买入: {top_name}"
+                            action_text = f"✅ 建议买入: {top_name_display}"
                             action_color = "green"
                             reason_text = f"主模型 ({primary_model}) 综合评分最高 ({top_score:.4f})。"
                     else:
@@ -1178,7 +1279,7 @@ elif st.session_state.page == "dashboard":
                                 action_color = "red"
                                 reason_text = f"持有标的转弱，建议避险。"
                             else:
-                                action_text = f"🔄 建议调仓: {current_holding} -> {top_name}"
+                                action_text = f"🔄 建议调仓: {current_holding} -> {top_name_display}"
                                 action_color = "orange"
                                 reason_text = f"发现更优标的，得分优势显著 ({top_score:.4f})。"
 
@@ -1652,7 +1753,84 @@ elif st.session_state.page == "dashboard":
                                 height=200
                             ).interactive()
                             
+                            # Net Value Chart (Improved)
+                            # 使用 scale(zero=False) 解除 Y 轴强制从 0 开始，使曲线细节更明显
+                            # 增加 Area 阴影填充，增强视觉效果
+                            c_nav = alt.Chart(sub).mark_area(
+                                line={'color': 'blue'},
+                                color=alt.Gradient(
+                                    gradient='linear',
+                                    stops=[alt.GradientStop(color='lightblue', offset=0),
+                                           alt.GradientStop(color='white', offset=1)],
+                                    x1=1, x2=1, y1=1, y2=0
+                                ),
+                                opacity=0.5
+                            ).encode(
+                                x=alt.X('date:T', title='日期'),
+                                y=alt.Y('cumulative_ret', title='累计收益率', axis=alt.Axis(format='%', titleColor='blue'), scale=alt.Scale(zero=False)),
+                                tooltip=[
+                                    alt.Tooltip('date', title='日期', format='%Y-%m-%d'),
+                                    alt.Tooltip('cumulative_ret', title='累计收益', format='.2%')
+                                ]
+                            ).properties(
+                                title='策略累计收益曲线 (Net Value)',
+                                height=250
+                            ).interactive()
+                            
+                            st.altair_chart(c_nav, use_container_width=True)
                             st.altair_chart(c_dd, use_container_width=True)
+                            
+                            # --- Strategy Health Check (Thermometer) ---
+                            st.markdown("##### 🏥 策略健康度体检 (基于净值曲线)")
+                            
+                            # 构造净值 DataFrame
+                            df_equity = sub[['date', 'cumulative_ret']].copy()
+                            df_equity['close'] = df_equity['cumulative_ret'] + 1 # 净值从 1.0 开始
+                            df_equity = df_equity.set_index('date')
+                            
+                            # 计算温度计
+                            therm, therm_ma = calculate_thermometer(df_equity)
+                            
+                            # 合并到 DataFrame
+                            df_health = df_equity.copy()
+                            df_health['thermometer'] = therm
+                            df_health['therm_ma'] = therm_ma
+                            df_health = df_health.reset_index()
+                            
+                            # 绘制温度计曲线
+                            base_health = alt.Chart(df_health).encode(x=alt.X('date:T', title='日期'))
+                            
+                            # 温度计主线
+                            line_therm = base_health.mark_line(color='purple', size=2).encode(
+                                y=alt.Y('thermometer', title='策略温度 (0-100)', scale=alt.Scale(domain=[0, 100])),
+                                tooltip=[
+                                    alt.Tooltip('date', title='日期', format='%Y-%m-%d'),
+                                    alt.Tooltip('thermometer', title='健康度', format='.1f'),
+                                    alt.Tooltip('therm_ma', title='3日均线', format='.1f')
+                                ]
+                            )
+                            
+                            # 均线
+                            line_ma = base_health.mark_line(color='orange', strokeDash=[3,3]).encode(
+                                y='therm_ma'
+                            )
+                            
+                            # 阈值区域背景
+                            # 高风险区 (>80)
+                            area_hot = alt.Chart(pd.DataFrame({'y': [80], 'y2': [100]})).mark_rect(color='red', opacity=0.1).encode(y='y', y2='y2')
+                            # 低估值区 (<20)
+                            area_cold = alt.Chart(pd.DataFrame({'y': [0], 'y2': [20]})).mark_rect(color='green', opacity=0.1).encode(y='y', y2='y2')
+                            
+                            st.altair_chart((area_hot + area_cold + line_therm + line_ma).interactive(), use_container_width=True)
+                            
+                            # 解读
+                            curr_therm = df_health['thermometer'].iloc[-1]
+                            if curr_therm > 80:
+                                st.warning(f"🔥 当前策略温度过高 ({curr_therm:.1f})，处于【超买/拥挤】区域，短期可能面临回撤风险。")
+                            elif curr_therm < 20:
+                                st.success(f"❄️ 当前策略温度极低 ({curr_therm:.1f})，处于【超卖/冰点】区域，可能是反弹或失效的信号。")
+                            else:
+                                st.info(f"🌡️ 当前策略温度适中 ({curr_therm:.1f})，运行平稳。")
                             
                             # Top 5 Drawdowns
                             st.markdown("##### 📉 历史前 5 大回撤区间")
@@ -1680,17 +1858,92 @@ elif st.session_state.page == "dashboard":
                                 use_container_width=True
                             )
                             
-                            # Holding Pie
-                            h_counts = sub['holding'].value_counts().reset_index()
-                            h_counts.columns = ['Asset', 'Days']
-                            c_pie = alt.Chart(h_counts).mark_arc().encode(
-                                theta='Days', color='Asset', tooltip=['Asset', 'Days']
+                            # Asset Contribution Analysis (Replaces Pie Chart)
+                            st.markdown("##### 💰 各资产累计收益贡献 (Profit Contribution)")
+                            
+                            # Calculate cumulative return contribution per asset
+                            # We need to group by 'holding' and sum 'daily_ret'
+                            # Note: Simple sum of daily_ret is approximation of log return contribution.
+                            # For precise attribution:
+                            # Contribution_i = Product(1+r_t) - 1 where r_t is return when holding asset i, else 0? No.
+                            # Better metric: Sum of daily dollar P&L if we started with $1?
+                            # Let's use Sum of Daily Returns for simplicity and visualization
+                            
+                            asset_contrib = sub.groupby('holding')['daily_ret'].sum().reset_index()
+                            asset_contrib.columns = ['Asset', 'TotalReturn']
+                            asset_contrib = asset_contrib.sort_values('TotalReturn', ascending=False)
+                            
+                            # Bar Chart for Contribution
+                            c_bar = alt.Chart(asset_contrib).mark_bar().encode(
+                                x=alt.X('TotalReturn', title='累计收益贡献', axis=alt.Axis(format='%')),
+                                y=alt.Y('Asset', sort='-x', title='资产名称'),
+                                color=alt.condition(
+                                    alt.datum.TotalReturn > 0,
+                                    alt.value('green'),
+                                    alt.value('red')
+                                ),
+                                tooltip=['Asset', alt.Tooltip('TotalReturn', format='.2%')]
+                            ).properties(height=300)
+                            
+                            st.altair_chart(c_bar, use_container_width=True)
+                            
+                            # --- Strategy Health Check (Thermometer) ---
+                            st.markdown("##### 🏥 策略健康度体检 (基于净值曲线)")
+                            
+                            # 构造净值 DataFrame
+                            df_equity = sub[['date', 'cumulative_ret']].copy()
+                            df_equity['close'] = df_equity['cumulative_ret'] + 1 # 净值从 1.0 开始
+                            df_equity = df_equity.set_index('date')
+                            
+                            # 计算温度计
+                            therm, therm_ma = calculate_thermometer(df_equity)
+                            
+                            # 合并到 DataFrame
+                            df_health = df_equity.copy()
+                            df_health['thermometer'] = therm
+                            df_health['therm_ma'] = therm_ma
+                            df_health = df_health.reset_index()
+                            
+                            # 绘制温度计曲线
+                            base_health = alt.Chart(df_health).encode(x=alt.X('date:T', title='日期'))
+                            
+                            # 温度计主线
+                            line_therm = base_health.mark_line(color='purple', size=2).encode(
+                                y=alt.Y('thermometer', title='策略温度 (0-100)', scale=alt.Scale(domain=[0, 100])),
+                                tooltip=[
+                                    alt.Tooltip('date', title='日期', format='%Y-%m-%d'),
+                                    alt.Tooltip('thermometer', title='健康度', format='.1f'),
+                                    alt.Tooltip('therm_ma', title='3日均线', format='.1f')
+                                ]
                             )
-                            st.altair_chart(c_pie)
+                            
+                            # 均线
+                            line_ma = base_health.mark_line(color='orange', strokeDash=[3,3]).encode(
+                                y='therm_ma'
+                            )
+                            
+                            # 阈值区域背景
+                            # 高风险区 (>80)
+                            area_hot = alt.Chart(pd.DataFrame({'y': [80], 'y2': [100]})).mark_rect(color='red', opacity=0.1).encode(y='y', y2='y2')
+                            # 低估值区 (<20)
+                            area_cold = alt.Chart(pd.DataFrame({'y': [0], 'y2': [20]})).mark_rect(color='green', opacity=0.1).encode(y='y', y2='y2')
+                            
+                            st.altair_chart((area_hot + area_cold + line_therm + line_ma).interactive(), use_container_width=True)
+                            
+                            # 解读
+                            curr_therm = df_health['thermometer'].iloc[-1]
+                            if curr_therm > 80:
+                                st.warning(f"🔥 当前策略温度过高 ({curr_therm:.1f})，处于【超买/拥挤】区域，短期可能面临回撤风险。")
+                            elif curr_therm < 20:
+                                st.success(f"❄️ 当前策略温度极低 ({curr_therm:.1f})，处于【超卖/冰点】区域，可能是反弹或失效的信号。")
+                            else:
+                                st.info(f"🌡️ 当前策略温度适中 ({curr_therm:.1f})，运行平稳。")
+                
                 else:
-                    st.error("回测失败")
-    else:
-        st.error("模型未加载")
+                    st.error("回测失败：未生成任何结果")
+
+    elif not model_loaded:
+        st.error("模型未加载，无法进行回测。请在侧边栏选择有效的模型版本。")
 
 
 st.markdown("---")
